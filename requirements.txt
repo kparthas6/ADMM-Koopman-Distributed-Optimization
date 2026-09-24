@@ -1,0 +1,5 @@
+# tested with Python 3.12, mujoco 3.14.0, jax 0.11.2, qpax 0.1.4, numpy 2.4.4
+mujoco>=3.14
+jax>=0.11.2
+qpax>=0.1.4
+numpy>=2.4
