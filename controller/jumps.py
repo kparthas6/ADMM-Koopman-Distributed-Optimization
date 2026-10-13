@@ -86,6 +86,59 @@ def flight_foot(J, Jc, hf, tf, v_b):
     return np.array([hf[0] + x_to + (x_land - x_to)*u, hf[1] + 0.10*v_b[1], -depth])
 
 
+def run_jumps(sim, legs, jumps, body="dhmpc", exact_torques=True, t_after=0.8, verbose=True):
+    """Closed loop for a list of Jump objects, executed back to back from a stand. body 'dhmpc'
+    (horizon, KA.DHMPC_CFG) | 'dist' (instantaneous); exact_torques: stance torques by
+    stance_torques() instead of bias - J^T f. Returns (log, upright); log['events'] lists
+    (name, t) for start, push, takeoff, touchdown and rest."""
+    if body not in ("dist", "dhmpc"):
+        raise ValueError("body must be 'dist' or 'dhmpc'")
+    C = JUMP_CFG; T_abs, T_brake = C["T_abs"], C["T_brake"]
+    NH, DTH, NIT = KA.DHMPC_CFG["N"], KA.DHMPC_CFG["dt"], KA.DHMPC_CFG["iters"]
+    if legs is None:
+        legs = KA.learn_operators()
+    fl = flight_legs(legs)
+    sim.reset(); dt = sim.control_dt
+    for _ in range(200):                                      # settle at the home pose, as run()
+        q, qd = sim.leg_state(); sim.step(80*(sim.q_home-q) - 2*qd + sim.bias_torque())
+    m = sim.mass; mg = m*G; MU = 0.7
+    I_BODY = np.diag([0.1268, 0.394, 0.4229])
+    f_nom = {i: np.array([0., 0., mg/4]) for i in ALL}
+    Q_trk = np.diag([400., 400., 400., 30., 30., 15.]); K_TH = np.array([40., 40., 3.5])
+    home = {i: kin.fk_leg(kin.HOME_LEG, kin.HIP_OFFSETS[i], kin.THIGH_Y[i]) for i in ALL}
+    damp, fric = sim.m.dof_damping[sim.vadr].copy(), sim.m.dof_frictionloss[sim.vadr].copy()
+    M = np.zeros((sim.m.nv, sim.m.nv)); bid = sim.trunk_bid
+    mujoco.mj_subtreeVel(sim.m, sim.d)
+    off = float(sim.d.qpos[2] - sim.d.subtree_com[bid][2])   # trunk above CoM: plans run on the CoM
+    z_stand = C["z_stand"] - off; plans = [j.shifted(off) for j in jumps]
+    yaw_ref = float(sim.trunk_rpy()[2]); I_yaw = 0.0
+    swing_q = {i: kin.HOME_LEG.copy() for i in ALL}
+    h_state, bt_state = {}, {}
+    ji, mode, t_mode, n_off, airborne, land, to, z_rest0 = -1, "stand", 0.0, 0, False, None, None, z_stand
+    nst = int((C["t_settle"] + sum(j.t_crouch + j.t_hold + j.Tp + j.Tf + T_brake + C["rest"] + 0.2 for j in jumps)
+               + t_after)/dt)
+    log = {k: [] for k in ["t", "phase", "roll", "pitch", "yaw", "z", "com", "vcom", "F", "contact", "qpos"]}
+    events = []; t0 = time.time(); up = True
+    for stp in range(nst):
+        t = stp*dt
+        q_all, qd_all = sim.leg_state(); tw = sim.trunk_pose()[1]
+        rpy = sim.trunk_rpy(); R = KA.quat2R(sim.d.qpos[3:7])
+        mujoco.mj_subtreeVel(sim.m, sim.d)
+        com, vcom = sim.d.subtree_com[bid].copy(), sim.d.subtree_linvel[bid].copy()
+        feet = sim.foot_pos_world(); bias = sim.bias_torque(); cvec = sim.contacts()
+        cy_, sy_ = np.cos(rpy[2]), np.sin(rpy[2])
+        Rz = np.array([[cy_, -sy_, 0.], [sy_, cy_, 0.], [0., 0., 1.]])
+        x_h, v_h = (Rz.T @ com)[0], Rz.T @ vcom                 # heading frame
+        x_feet = float(np.mean((Rz.T @ feet.T)[0]))
+        # ---- phases
+        wait = C["t_settle"] if mode == "stand" else C["rest"]
+        if mode in ("stand", "rest") and ji + 1 < len(jumps) and t - t_mode >= wait:
+            ji += 1; J, Jc = jumps[ji], plans[ji]; mode, t_mode = "crouch", t; x_c0, z_c0 = x_h, com[2]
+            events.append(("start", t))
+        if mode == "crouch" and t - t_mode >= Jc.t_crouch + Jc.t_hold:
+            mode, t_mode = "push", t; events.append(("push", t))
+        if mode == "push":
+            n_off = n_off + 1 if cvec.sum() == 0 else 0     # the feet left early: sensed takeoff
             if t - t_mode >= Jc.Tp or (n_off >= 2 and t - t_mode > 0.3*Jc.Tp):
                 mode, t_mode, airborne = "flight", t, False; to = (x_h, com[2]); events.append(("takeoff", t))
         if mode == "flight":
