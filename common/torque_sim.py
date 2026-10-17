@@ -7,8 +7,21 @@ _SCENE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model",
 
 
 class TorqueSim:
-    def __init__(self, control_dt=0.005, sim_dt=0.001, view=None, key_callback=None):
-        self.m = mujoco.MjModel.from_xml_path(os.path.abspath(_SCENE))
+    def __init__(self, control_dt=0.005, sim_dt=0.001, view=None, key_callback=None, obstacles=None):
+        """obstacles: optional (x, y, r) vertical cylinders (0.5 m tall) and (x, y, z, r) spheres added to
+        the scene as solid world geoms."""
+        obstacles = [tuple(o) for o in obstacles] if obstacles is not None else []
+        if obstacles:
+            spec = mujoco.MjSpec.from_file(os.path.abspath(_SCENE))
+            for j, o in enumerate(obstacles):
+                g = spec.worldbody.add_geom(); g.name = f"obstacle{j}"; g.rgba = [0.85, 0.35, 0.2, 1.0]
+                if len(o) == 3:
+                    g.type = mujoco.mjtGeom.mjGEOM_CYLINDER; g.size = [o[2], 0.25, 0.0]; g.pos = [o[0], o[1], 0.25]
+                else:
+                    g.type = mujoco.mjtGeom.mjGEOM_SPHERE; g.size = [o[3], 0.0, 0.0]; g.pos = [o[0], o[1], o[2]]
+            self.m = spec.compile()
+        else:
+            self.m = mujoco.MjModel.from_xml_path(os.path.abspath(_SCENE))
         self.m.opt.timestep = sim_dt
         self.d = mujoco.MjData(self.m)
         self.substeps = max(1, int(round(control_dt / sim_dt)))
@@ -21,6 +34,7 @@ class TorqueSim:
         self.foot_gids = [oid(mujoco.mjtObj.mjOBJ_GEOM, l) for l in LEGS]
         self.trunk_bid = oid(mujoco.mjtObj.mjOBJ_BODY, "trunk")
         self.floor_gid = oid(mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        self.obstacle_gids = [oid(mujoco.mjtObj.mjOBJ_GEOM, f"obstacle{j}") for j in range(len(obstacles))]
         self.tau_lo = self.m.actuator_ctrlrange[self.aadr, 0].copy()
         self.tau_hi = self.m.actuator_ctrlrange[self.aadr, 1].copy()
         self.mass = float(np.sum(self.m.body_mass))
@@ -88,6 +102,11 @@ class TorqueSim:
             mujoco.mj_contactForce(self.m, self.d, c, self._cf6)
             F[idx] += s * (con.frame.reshape(3, 3).T @ self._cf6[:3])
         return F
+
+    def obstacle_contacts(self):
+        """Number of active contacts between the robot and the obstacle geoms."""
+        og = set(self.obstacle_gids)
+        return sum(1 for c in range(self.d.ncon) if self.d.contact[c].geom1 in og or self.d.contact[c].geom2 in og)
 
     def contacts(self):
         return (np.linalg.norm(self.foot_grf(), axis=1) > 1.0).astype(np.float32)
