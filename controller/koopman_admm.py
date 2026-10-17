@@ -11,6 +11,9 @@ import dist_wrench as DW, dist_horizon as DH
 DIAG = {0: [0, 3], 1: [1, 2]}                                  # trot diagonals
 DHMPC_CFG = {"N": 8, "dt": 0.020, "iters": 8, "tol": 0.0}      # horizon steps and step length, ADMM
                                                                # iterations per tick, early-stop tolerance
+KEEPOUT_CFG = {"bodies": [[0.19, 0., 0., 0.17], [0., 0., 0., 0.17], [-0.19, 0., 0., 0.17]],   # trunk-frame spheres [x, y, z, r]
+               "rows": dict(sigma_f=20.0, sigma_t=3.0, margin=0.02, act_dist=0.30),   # tube, see DH.KEEPOUT_DEFAULTS
+               "steer": dict(look=0.8, clear=0.06, max_off=1.2, n_cand=49, hyst=0.5, rate=0.8)}
 NZ = 17
 C_Q = np.zeros((3, NZ)); C_Q[:, 0:3] = np.eye(3)
 C_QD = np.zeros((3, NZ)); C_QD[:, 3:6] = np.eye(3)
@@ -140,6 +143,64 @@ def quat2R(q):
                      [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]])
 
 
+def obstacle_array(obstacles):
+    """(x, y, r) vertical cylinders and (x, y, z, r) spheres -> rows [cx, cy, cz, r, cylinder]."""
+    return np.array([[o[0], o[1], 0.0, o[2], 1.0] if len(o) == 3 else [o[0], o[1], o[2], o[3], 0.0]
+                     for o in obstacles], float).reshape(-1, 5)
+
+
+def _seg_dist(c, a, b):
+    """Distance from points c (..., 2) to segments [a, b] (..., 2)."""
+    ab = b - a
+    t = np.clip(((c - a)*ab).sum(-1)/np.maximum((ab*ab).sum(-1), 1e-12), 0.0, 1.0)
+    return np.linalg.norm(a + t[..., None]*ab - c, axis=-1)
+
+
+def steer_offset(pos, yaw_cmd, v_cmd, obs, prev=0.0, cfg=None):
+    """Heading offset (rad) from the commanded walking direction: of n_cand headings within +-max_off,
+    the one closest to the command (plus a hysteresis pull to `prev`) along which the trunk's body
+    segment (rear to front sphere centre, on the body axis), swept `look` m along the direction of
+    travel, clears every obstacle by r_b + `clear`; spheres count where they cross the trunk height.
+    0 when the command is clear; with no heading clear, the least-blocked one. A reference shaper, not
+    a planner: the keep-out rows in layer 1 are what keep the trunk out."""
+    c = KEEPOUT_CFG["steer"] if cfg is None else cfg
+    cy, sy = np.cos(yaw_cmd), np.sin(yaw_cmd)
+    vc = np.array([cy*v_cmd[0] - sy*v_cmd[1], sy*v_cmd[0] + cy*v_cmd[1]])
+    if np.linalg.norm(vc) < 1e-3:
+        return 0.0
+    bod = np.asarray(KEEPOUT_CFG["bodies"], float)
+    xf, xr, rb = bod[:, 0].max(), bod[:, 0].min(), bod[:, 3].max()
+    off = np.linspace(-c["max_off"], c["max_off"], c["n_cand"])
+    a = np.arctan2(vc[1], vc[0]) + off                        # travel directions
+    ab = a - np.arctan2(v_cmd[1], v_cmd[0])                    # body headings that walk them
+    u = np.stack([np.cos(a), np.sin(a)], -1)[:, None]          # (n_cand, 1, 2)
+    e = np.stack([np.cos(ab), np.sin(ab)], -1)[:, None]
+    p0, p1, du = pos[:2] + xr*e, pos[:2] + xf*e, c["look"]*u   # swept parallelogram p0, p1, p1 + du, p0 + du
+    o = obs[None, :, :2]
+    dist = np.minimum(np.minimum(_seg_dist(o, p0, p1), _seg_dist(o, p0 + du, p1 + du)),
+                      np.minimum(_seg_dist(o, p0, p0 + du), _seg_dist(o, p1, p1 + du)))
+    m1, m2, q = p1 - p0, du, o - p0                            # inside: q = al m1 + be m2, 0 <= al, be <= 1
+    det = m1[..., 0]*m2[..., 1] - m1[..., 1]*m2[..., 0]
+    ok = np.abs(det) > 1e-9; dd = np.where(ok, det, 1.0)
+    al = (q[..., 0]*m2[..., 1] - q[..., 1]*m2[..., 0])/dd; be = (m1[..., 0]*q[..., 1] - m1[..., 1]*q[..., 0])/dd
+    dist = np.where(ok & (al >= 0) & (al <= 1) & (be >= 0) & (be <= 1), 0.0, dist)
+    dz = np.where(obs[:, 4] > 0.5, 0.0, obs[:, 2] - pos[2])
+    reach = (obs[:, 3] + rb + c["clear"])**2 - dz**2          # spheres: slice at trunk height, if any
+    rr = np.where(reach > 0.0, np.sqrt(np.maximum(reach, 0.0)), -np.inf)      # needed clearance in the plane
+    score = (dist - rr[None]).min(1)
+    if score[c["n_cand"]//2] > 0.0:
+        return 0.0
+    ok = score > 0.0 if score.max() > 0.0 else score >= score.max() - 1e-3
+    cost = np.abs(off) + c["hyst"]*np.abs(off - prev)
+    return float(off[np.argmin(np.where(ok, cost, np.inf))])
+
+
+def keepout_clearance(pts, obs, bod):
+    """Smallest surface distance between body spheres centred at pts (..., NB, 3) and the obstacles."""
+    dv = (pts[..., :, None, :] - obs[:, :3])*np.where(obs[:, 4:5] > 0.5, [1., 1., 0.], 1.)
+    return float((np.linalg.norm(dv, axis=-1) - obs[:, 3] - bod[:, None, 3]).min())
+
+
 def ik_leg(target, q0, hip, ty, iters=10):
     q = np.array(q0, float)
     for _ in range(iters):
@@ -151,13 +212,22 @@ def ik_leg(target, q0, hip, ty, iters=10):
 
 
 def run(sim, legs, mode="stand", seconds=10.0, vx=0.0, wz=0.0, push=0.0, vy=0.0, iters=30,
-        body="dhmpc", verbose=True, contact_gate=False, gait_T=0.10, duty=1.0, k_cap=0.10, stop=None):
+        body="dhmpc", verbose=True, contact_gate=False, gait_T=0.10, duty=1.0, k_cap=0.10, stop=None,
+        obstacles=None, steer=True):
     """Closed loop. mode 'stand' | 'trot' (diagonal pairs swap every gait_T, duty < 1 adds
     flight); body 'dhmpc' (horizon, DHMPC_CFG) | 'dist' (instantaneous, `iters` iterations);
     k_cap is the foothold capture gain (0 disables capture).
-    vx, vy, wz may be callables of time; `stop()` is polled every tick. Returns (log, upright)."""
+    vx, vy, wz may be callables of time; `stop()` is polled every tick. Returns (log, upright).
+    obstacles: (x, y, r) cylinders and (x, y, z, r) spheres kept clear of the trunk's body spheres
+    (KEEPOUT_CFG) by keep-out rows in the dhmpc horizon; steer bends the walking direction around
+    them. The log then also holds per tick the trunk xy, the body-sphere clearance (m), obstacle
+    contacts, the plan's smallest clearance over the horizon, the active keep-out rows, the largest
+    row multiplier and the steering heading offset (rad)."""
     if body not in ("dist", "dhmpc"):
         raise ValueError("body must be 'dist' or 'dhmpc'")
+    obs = obstacle_array(obstacles) if obstacles is not None and len(obstacles) else None
+    if obs is not None and body != "dhmpc":
+        raise ValueError("obstacles need body='dhmpc'")
     NH, DTH, NIT, TOL = DHMPC_CFG["N"], DHMPC_CFG["dt"], DHMPC_CFG["iters"], DHMPC_CFG["tol"]
     yaw_ref = float(sim.trunk_rpy()[2]); I_yaw = 0.0
     m_tot = sim.mass
@@ -173,8 +243,11 @@ def run(sim, legs, mode="stand", seconds=10.0, vx=0.0, wz=0.0, push=0.0, vy=0.0,
         q, qd = sim.leg_state(); sim.step(80*(sim.q_home-q) - 2*qd + sim.bias_torque())
     nst = int(seconds/dt); cmd = (vx, vy, wz); live = any(callable(c) for c in cmd)
     bt_state, h_state = {}, {}
-    log = {k: [] for k in ["roll", "pitch", "yaw", "z", "wz", "vx", "qpos"]}
+    log = {k: [] for k in ["roll", "pitch", "yaw", "z", "wz", "vx", "qpos"] +
+           (["xy", "clear", "hits", "plan_clear", "rows", "lam", "steer"] if obs is not None else [])}
     swing_q = {i: kin.HOME_LEG.copy() for i in range(4)}; t0 = time.time()
+    yaw_off, yaw_un = 0.0, yaw_ref
+    bod = np.asarray(KEEPOUT_CFG["bodies"], float)
     for stp in range(nst):
         t = stp*dt
         if live:
@@ -200,7 +273,12 @@ def run(sim, legs, mode="stand", seconds=10.0, vx=0.0, wz=0.0, push=0.0, vy=0.0,
             if not gated: reach = set()
         ez_ = z0 - pos[2]
         yaw_ref += wz*dt
-        e_yaw = (rpy[2] - yaw_ref + np.pi) % (2*np.pi) - np.pi
+        wz_ff = 0.0
+        if obs is not None and steer:                         # walk around: offset the heading reference
+            lim = KEEPOUT_CFG["steer"]["rate"]*dt
+            wz_ff = float(np.clip(steer_offset(pos, yaw_ref, (vx, vy), obs, yaw_off) - yaw_off, -lim, lim))/dt
+            yaw_off += wz_ff*dt
+        e_yaw = (rpy[2] - yaw_ref - yaw_off + np.pi) % (2*np.pi) - np.pi
         I_yaw = np.clip(I_yaw + e_yaw*dt, -0.4, 0.4)
         e_yaw = e_yaw + 1.5*I_yaw
         cy_, sy_ = np.cos(rpy[2]), np.sin(rpy[2])            # world axes throughout: grasp-map moments are world-frame
@@ -228,10 +306,15 @@ def run(sim, legs, mode="stand", seconds=10.0, vx=0.0, wz=0.0, push=0.0, vy=0.0,
             else:
                 Gs_seq = [grasp_maps(feet, com, st) for st in sched]
             vd = [v_ref_w - 25.0*np.array([0., 0., -ez_]) for _ in range(NH)]
-            wd = [np.array([0., 0., wz]) - np.array([40., 40., 3.5])*e_th_w for _ in range(NH)]
+            wd = [np.array([0., 0., wz + wz_ff]) - np.array([40., 40., 3.5])*e_th_w for _ in range(NH)]
+            ko = None
+            if obs is not None:                               # pose [p, Theta] with unwrapped yaw
+                yaw_un += (rpy[2] - yaw_un + np.pi) % (2*np.pi) - np.pi
+                ko = dict(KEEPOUT_CFG["rows"], obstacles=obs, bodies=bod,
+                          pose0=np.r_[pos, Rz @ np.array([rpy[0], rpy[1], 0.]) + np.array([0., 0., yaw_un])])
             _, Ftr = DH.distributed_horizon(np.concatenate([tw[0:3], w_w]), vd, wd, Gs_seq, f_nom, Q_trk, m_tot,
                                             I_W, DTH, NH, 0.005, MU, mg, iters=NIT, state=h_state,
-                                            shift=dt/DTH, tol=TOL)
+                                            shift=dt/DTH, tol=TOL, keepout=ko)
             F = {i: (Ftr[i][0] if i in Ftr else f_nom[i]) for i in stance}
         else:
             e0, D_w = DW.body_tracking_terms(dict(v=tw[0:3], w=w_w, e_p=np.array([0., 0., -ez_]), e_th=e_th_w),
@@ -250,7 +333,7 @@ def run(sim, legs, mode="stand", seconds=10.0, vx=0.0, wz=0.0, push=0.0, vy=0.0,
                 J = kin.jac_leg(qi, kin.HIP_OFFSETS[i], kin.THIGH_Y[i])
                 tau[3*i:3*i+3] = bias[3*i:3*i+3] - J.T @ (R.T @ F[i])
             else:
-                dpsi = wz*(2*T)*(s_ph-0.5); cz, sz = np.cos(dpsi), np.sin(dpsi); hf = home[i]
+                dpsi = (wz + wz_ff)*(2*T)*(s_ph-0.5); cz, sz = np.cos(dpsi), np.sin(dpsi); hf = home[i]
                 fr = np.array([cz*hf[0]-sz*hf[1], sz*hf[0]+cz*hf[1], hf[2]])
                 if i in lifted:                               # flight: tuck back, ready to sweep
                     ft = fr + np.array([-0.45*stride, k_cap*v_b[1], 0.04])
@@ -270,6 +353,14 @@ def run(sim, legs, mode="stand", seconds=10.0, vx=0.0, wz=0.0, push=0.0, vy=0.0,
             log[k].append(np.degrees(v))
         log["z"].append(sim.trunk_z()); log["wz"].append(tw[5]); log["vx"].append(tw[0])
         log["qpos"].append(sim.d.qpos.copy())
+        if obs is not None:
+            hh = h_state["h"]; cp, sp = np.cos(hh["xp"][:, 5:6]), np.sin(hh["xp"][:, 5:6])
+            plan = hh["xp"][:, None, :3] + np.stack([cp*bod[:, 0] - sp*bod[:, 1], sp*bod[:, 0] + cp*bod[:, 1],
+                                                     np.broadcast_to(bod[:, 2], cp.shape[:1] + bod[:, 2].shape)], -1)
+            log["xy"].append(pos[:2].copy()); log["hits"].append(sim.obstacle_contacts())
+            log["clear"].append(keepout_clearance(pos[None] + bod[:, :3] @ R.T, obs, bod))   # before this tick's step
+            log["plan_clear"].append(keepout_clearance(plan, obs, bod)); log["rows"].append(int(hh["on"].sum()))
+            log["lam"].append(float(hh["lamc"].max())); log["steer"].append(yaw_off)
         if sim.trunk_z() < 0.12:
             if verbose: print(f"  FELL at t={t:.2f}s")
             break
@@ -277,7 +368,9 @@ def run(sim, legs, mode="stand", seconds=10.0, vx=0.0, wz=0.0, push=0.0, vy=0.0,
     if verbose:
         tilt = np.maximum(np.abs(L["roll"]), np.abs(L["pitch"])).max()
         turn = f" | turn {L['yaw'][-1] - L['yaw'][0]:+.0f} deg" if wz else ""
-        print(f"  {mode} ({body}) | tilt max {tilt:.1f} deg | z {L['z'][-1]:.3f}{turn} | "
+        keep = (f" | clearance min {100*L['clear'].min():+.1f} cm | obstacle contacts {int((L['hits'] > 0).sum())} ticks"
+                if obs is not None else "")
+        print(f"  {mode} ({body}) | tilt max {tilt:.1f} deg | z {L['z'][-1]:.3f}{turn}{keep} | "
               f"{nst/(time.time() - t0):.0f} steps/s | {'UP' if up else 'FELL'}")
     return L, up
 
@@ -285,8 +378,10 @@ def run(sim, legs, mode="stand", seconds=10.0, vx=0.0, wz=0.0, push=0.0, vy=0.0,
 if __name__ == "__main__":
     env = os.environ.get
     legs = learn_operators()
-    sim = TorqueSim(control_dt=0.005)
+    obstacles = [tuple(float(v) for v in o.split(",")) for o in env("OBST", "").split(";") if o.strip()] or None
+    sim = TorqueSim(control_dt=0.005, obstacles=obstacles)
     run(sim, legs, env("MODE", "trot"), float(env("SECONDS", "6")), vx=float(env("VX", "0")),
         wz=float(env("WZ", "0")), push=float(env("PUSH", "0")), vy=float(env("VY", "0")),
-        iters=int(env("ITERS", "30")), body=env("BODY", "dhmpc"), gait_T=float(env("GAIT_T", "0.10")))
+        iters=int(env("ITERS", "30")), body=env("BODY", "dhmpc"), gait_T=float(env("GAIT_T", "0.10")),
+        obstacles=obstacles, steer=env("STEER", "1") != "0")
     sim.hold()
