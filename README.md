@@ -50,6 +50,11 @@ common/leg_kinematics.py    leg forward kinematics and Jacobian
 controller/koopman_admm.py  Koopman legs, operator fitting, run() closed loop, command line
 controller/dist_horizon.py  layer 1, horizon form (dhmpc, the default)
 controller/dist_wrench.py   layer 1, instantaneous form (dist) and the exact per-leg force solver
+controller/jumps.py         jumping: crouch, push, flight and landing on top of layer 1
+MATH.md                     the formulation: costs, constraints, keep-out, ADMM, steering, Koopman legs
+tests/                      pytest checks of the keep-out (fast) and closed-loop runs (--runslow)
+experiments/                obstacle scenarios, convergence, solve-time benchmark, figures, videos
+docs/figures/               figures the Obstacles section shows (made by experiments/plot_results.py)
 ```
 
 `model/`, `common/` and `controller/` must stay side by side: the code finds the model and the
@@ -62,7 +67,11 @@ Tested with Python 3.12, mujoco 3.14, jax 0.11.2 (CPU), qpax 0.1.4 and numpy 2.4
 
 ```
 pip install -r requirements.txt
+pip install -r requirements-dev.txt     # tests and experiments: pytest, matplotlib, pillow
 ```
+
+The obstacle keep-out, the tests and the experiments were run with Python 3.13, mujoco 3.15,
+jax 0.11.2 (CPU), qpax 0.1.4 and numpy 2.5.
 
 ## Running
 
@@ -105,6 +114,8 @@ Commands are constants or functions of time, given either as environment variabl
 | `PUSH` | shove on the trunk (N): world-frame force (PUSH, PUSH/2, 0) from t = 1.00 to 1.15 s | 0 |
 | `ITERS` | ADMM iterations per tick for `dist` | 30 |
 | `VIEW`, `VIEW_SPEED` | `VIEW=1` opens the viewer; `VIEW_SPEED` scales playback | off, 1.0 |
+| `OBST` | obstacles, `;`-separated: `x,y,r` a vertical cylinder, `x,y,z,r` a sphere (m), added to the scene and kept out (see Obstacles) | none |
+| `STEER` | `STEER=0` keeps the obstacles out without steering around them | 1 |
 
 The flight phase, contact gating and the capture gain are set from Python.
 
@@ -152,6 +163,8 @@ KA.run(sim, legs, "trot", seconds=600, vx=lambda t: cmd["vx"])
 | `iters` | ADMM iterations per tick for `dist` | 30 |
 | `stop` | function polled every tick; returning True ends the run | None |
 | `verbose` | print a one-line summary | True |
+| `obstacles` | list of `(x, y, r)` cylinders and `(x, y, z, r)` spheres to keep out (dhmpc only) | None |
+| `steer` | bend the walking direction around the obstacles | True |
 
 Horizon settings live in `KA.DHMPC_CFG = {"N": 8, "dt": 0.020, "iters": 8, "tol": 0.0}`: steps,
 step length (s), ADMM iterations per tick, and an early-stop tolerance (`tol > 0` ends a tick's
@@ -165,6 +178,92 @@ At the default half-period the trot shuffles with 3 cm steps and realizes about 
 0.3 m/s forward command on dhmpc; for speed, lengthen the period: `GAIT_T=0.30` carries a
 0.40 m/s command at 0.44 m/s for 10 s, and `duty=0.8` adds a flight phase at 0.44 m/s. A
 0.3 rad/s turn is tracked fully, and strafing realizes 55 to 60% of a 0.2 m/s command.
+
+## Obstacles
+
+```
+OBST="1.2,0,0.15" VX=0.3 GAIT_T=0.25 SECONDS=9 VIEW=1 python koopman_admm.py
+```
+
+```python
+obst = [(1.2, 0.0, 0.15), (2.0, 0.4, 0.32, 0.18)]       # a cylinder and a sphere at trunk height
+log, upright = KA.run(TorqueSim(obstacles=obst), legs, "trot", seconds=9, vx=0.3, gait_T=0.25, obstacles=obst)
+```
+
+`TorqueSim(obstacles=...)` adds the obstacles as solid geoms; `run(obstacles=...)` keeps them out.
+The trunk is covered by three body spheres (`KA.KEEPOUT_CFG["bodies"]`, radius 17 cm, at the trunk
+origin and 19 cm ahead of and behind it), and every step k of the dhmpc horizon gets, per obstacle
+and body sphere, the constraint
+
+```
+r_obs + r_b - || p_k + R_k b - c || + h_k <= 0          (cylinders: xy distance only)
+```
+
+the circle keep-out of GPU-SLS (Fang and Chou, arXiv 2604.07644). To carry it, the horizon also
+predicts trunk position and attitude, p_{k+1} = p_k + dt (v_k + v_{k+1})/2, exact for the
+piecewise-constant wrench. Each constraint is linearized at the previous tick's predicted pose,
+so it is the tangent half-space, which is inside the safe set whatever the linearization point (for
+the body-sphere centres; the rotation of the spheres with roll and pitch is linearized about level,
+and the 2 cm margin covers the rest). The heading is held at its predicted value in the rows: given
+the heading as a free variable, the plan turned the trunk to creep closer to a wall it was held at
+and fell.
+
+h_k is the GPU-SLS tightening (`get_betas`, `get_constraint_tightenings`): the sum over steps of
+the 2-norm of the row's response to a per-step wrench disturbance of 20 N and 3 N m, for the
+open-loop response, since only the first step's forces are applied before the next solve; 2 cm
+is added on top.
+
+In the ADMM each linearized row gets a scalar copy, updated in the same block as the per-foot
+force solves, so it stays two-block ADMM with the same fixed point as the constrained QP; the shared
+solve becomes `((QW + C' Rc C) Nk + rho I) d = (QW + C' Rc C) A + qW + C' Rc (nu - y_r)`, y_r the
+over-relaxed row copies (MATH.md). Forces stay
+inside the friction pyramid at every iterate; the keep-out holds at convergence, and the rows are
+soft (exact penalty) so the solve stays defined if one cannot be met. Rows more than 30 cm clear of
+their tube, and the step-0 rows (2 to 6 mm of authority), are left out. Without obstacles the
+controller is bit-for-bit unchanged.
+
+The rows only keep the trunk out; on their own they stop the robot at the obstacle or slide it
+sideways, and at 0.4 m/s with long strides the slide and release tipped it over. Steering bends the
+commanded walking direction: of 49 headings within 69 degrees of the command, it takes the closest
+one (with hysteresis) along which the trunk, its body axis set by the commanded walking direction
+and swept 0.8 m along the heading, clears every obstacle by 6 cm, turning at up to 0.8 rad/s; with
+no heading clear it takes the least-blocked one. It is a reference shaper, not a planner: a dead end
+still traps it, and the rows then hold the robot in front of the obstacle.
+
+In simulation (trot, gait_T 0.25 unless noted, rows plus steering), the robot passed a head-on
+cylinder at 0.3 m/s and at 0.4 m/s (gait_T 0.30), a sphere at trunk height, a 50 cm gap, three staggered cylinders,
+a diagonal walk (vy 0.2) past a cylinder and the end of an 8-cylinder wall without touching them,
+with 4.9 to 7.3 cm clearance; without the keep-out it hit the obstacles in every scenario but the
+gap. Rows alone held the robot in front of the wall. The rows add about 14% to the force solve with
+one obstacle and 29% with 42 rows active. In random
+trials at 0.4 m/s and short gait periods with turning, a few runs fell after passing the obstacle,
+with the rows inactive; the gait falls at those settings without obstacles too.
+
+![Trunk paths in the obstacle scenarios](docs/figures/01_paths_top_down.png)
+
+`docs/figures/` also holds the clearance over time (`02`), the controller's internals in the head-on
+run (`03`: heading offset, active rows, row multipliers, planned against realized clearance), the ADMM
+error against an exact QP solve with the tightening per step (`04`) and the solve-time cost (`05`).
+
+## Tests and experiments
+
+From the repository root:
+
+```
+pytest tests                    # keep-out against an independent dense QP, steering geometry, obstacle geoms
+pytest tests --runslow          # also: no-obstacle runs bit-identical to the controller before the
+                                # keep-out (taken from git), and every obstacle scenario in MuJoCo
+```
+
+From `experiments/` (outputs go to `results/`, which git ignores):
+
+```
+python scenarios.py             # every scenario x {none, rows, rows+steer} -> results/scenarios/*.npz
+python convergence.py           # ADMM error against the dense QP versus iterations
+python bench_solve.py           # layer-1 solve time with and without obstacles, against the old code
+python plot_results.py --out ../docs/figures      # the five figures and a results table
+MUJOCO_GL=egl python record_video.py headon rows+steer    # mp4 of one run (needs ffmpeg)
+```
 
 ## Results
 
