@@ -51,9 +51,11 @@ controller/koopman_admm.py  Koopman legs, operator fitting, run() closed loop, c
 controller/dist_horizon.py  layer 1, horizon form (dhmpc, the default)
 controller/dist_wrench.py   layer 1, instantaneous form (dist) and the exact per-leg force solver
 controller/jumps.py         jumping: crouch, push, flight and landing on top of layer 1
+controller/backend.py       JAX backend and precision (CPU float64, GPU float32), imported first
+controller/jax_loop.py      run()'s dhmpc controller in jax.numpy; batched closed loop on MJX (see GPU)
 MATH.md                     the formulation: costs, constraints, keep-out, ADMM, steering, Koopman legs
-tests/                      pytest checks of the keep-out (fast) and closed-loop runs (--runslow)
-experiments/                obstacle scenarios, convergence, solve-time benchmark, figures, videos
+tests/                      pytest checks of the keep-out and the GPU paths (fast) and closed-loop runs (--runslow)
+experiments/                obstacle scenarios, convergence, solve-time and GPU benchmarks, Monte Carlo, figures, videos
 docs/figures/               figures the Obstacles section shows (made by experiments/plot_results.py)
 ```
 
@@ -67,11 +69,12 @@ Tested with Python 3.12, mujoco 3.14, jax 0.11.2 (CPU), qpax 0.1.4 and numpy 2.4
 
 ```
 pip install -r requirements.txt
-pip install -r requirements-dev.txt     # tests and experiments: pytest, matplotlib, pillow
+pip install -r requirements-dev.txt     # tests and experiments: pytest, matplotlib, pillow, mujoco-mjx
+pip install -r requirements-gpu.txt     # NVIDIA GPU: the above plus jax[cuda12] (see GPU)
 ```
 
-The obstacle keep-out, the tests and the experiments were run with Python 3.13, mujoco 3.15,
-jax 0.11.2 (CPU), qpax 0.1.4 and numpy 2.5.
+The obstacle keep-out, the GPU paths, the tests and the experiments were run with Python 3.13, mujoco
+3.15, mujoco-mjx 3.15, jax 0.11.2 (CPU), qpax 0.1.4 and numpy 2.5. mujoco-mjx 3.15 needs mujoco 3.15.
 
 ## Running
 
@@ -245,15 +248,150 @@ with the rows inactive; the gait falls at those settings without obstacles too.
 run (`03`: heading offset, active rows, row multipliers, planned against realized clearance), the ADMM
 error against an exact QP solve with the tightening per step (`04`) and the solve-time cost (`05`).
 
+## GPU
+
+Everything JAX runs on a GPU, in two stages: GPU-ready solvers for the existing loop, and a batched
+closed loop of many robots on MJX. Both also run on the CPU, which is where they were tested: no GPU was
+available, so GPU speed has not been measured.
+
+**Install and switch.**
+
+```
+pip install -r requirements-gpu.txt                       # jax[cuda12] on top of the dev requirements
+cd controller && python -c "import backend; print(backend.info())"    # should say backend gpu, float32
+```
+
+- The CUDA wheels are Linux-only (WSL2 on Windows), and the NVIDIA driver must support the wheels' CUDA
+  version (JAX's installation guide lists it); `jax[cuda13]` is the variant for CUDA 13 drivers.
+- With `jax[cuda12]` installed, `auto` moves `koopman_admm.py` and `run()` onto the GPU in float32 as
+  well. For the single robot set `ADMM_PLATFORM=cpu`: float64, the validated path, and lower latency.
+- The first `Rollout.run` compiles one large program (about 45 s for two robots on this CPU) and every
+  new batch size, duration, `log` flag or switch to per-robot obstacles compiles again; keep them fixed
+  across a sweep and reuse the `Rollout`.
+- Memory grows with the batch: the MJX state of every robot, and with `log=True` per-tick traces of
+  B x ticks x about 12 values.
+- MJX prints "Failed to import warp" and "Failed to import mujoco_warp" when imported; that is harmless.
+
+**Backend and precision** (`controller/backend.py`, read at the first import):
+
+| Variable | Values | Default |
+|---|---|---|
+| `ADMM_PLATFORM` | `auto`, `cpu`, `gpu` | `auto`: the GPU when `jax[cuda12]` sees one |
+| `ADMM_PRECISION` | `auto`, `64`, `32` | `auto`: float64 on the CPU, float32 on a GPU |
+
+Consumer GPUs (GeForce/RTX) run float64 at 1/32 to 1/64 of their float32 rate, so the GPU default is
+float32. Two things make layer 1 work in float32. The per-foot solver's active-set test uses a 1e-3
+tolerance instead of 1e-7: float32 rounding on 100 N forces failed the 1e-7 test, which threw away the
+right facet and put the solution 10 to 27 N off. And float32 matmuls are pinned to full precision: XLA's
+default on Ampere and later GPUs is TF32, whose rounding (about 5e-4 relative, so 0.05 N on 100 N) would
+exceed that tolerance. On the reference problems float32 layer 1 is within 3.3e-3 N of float64 (median
+2.5e-4 N, on wrenches of about 130 N), and with float32 layer 1 all seven obstacle scenarios pass as in
+float64 (4.9 to 7.3 cm clearance). On the CPU in float64, every output is bit-for-bit what it was.
+
+**Batched layer 1.** `DH.pack_horizon` turns one `distributed_horizon` call into a flat vector,
+`DH.horizon_batch` solves a stack of them in one call (vmap), and `DH.unpack_horizon` splits the result.
+All problems in a batch share the horizon, the legs and the obstacle count; pad the count with far
+obstacles, whose rows stay off.
+
+**Batched closed loop** (`controller/jax_loop.py`). `Controller` is run()'s dhmpc controller as one
+jax.numpy step: predicted footholds, the layer-1 solve with the keep-out rows and its warm start,
+steering, swing IK and the four Koopman swing MPCs (qpax, vmapped), stance torques. `Rollout` runs it
+against MJX under `lax.scan` over ticks and `vmap` over robots, so a batch of closed-loop runs is one
+compiled program. Each robot has its own commands, start pose, push and obstacle layout (the obstacle
+count and types are fixed per `Rollout`).
+
+```python
+import numpy as np, jax_loop as JL                                  # from controller/
+roll = JL.Rollout(obstacles=[(1.2, 0.0, 0.15)], gait_T=0.25)
+rng, B = np.random.default_rng(0), 1024
+lay = [[(1.2 + rng.normal(0, 0.03), rng.normal(0, 0.03), 0.15)] for _ in range(B)]
+out = roll.run(9.0, vx=0.3, y0=rng.uniform(-0.05, 0.05, B), obstacles=lay)
+print(out["upright"].mean(), (out["contact_ticks"] == 0).mean(), out["min_clear"].min())
+```
+
+`run()` returns per-robot arrays: upright, ticks, max tilt, minimum clearance, obstacle-contact ticks,
+end position, and with `log=True` per-tick traces. `experiments/monte_carlo.py` runs the obstacle
+scenarios this way with randomized start poses and obstacle positions.
+
+The gait clock (phase, stance, the horizon's contact pattern, time to touchdown) is computed on the host
+in Python floats, as run() computes it, and passed to the step. Inside jit, XLA turns t/T into t*(1/T),
+and that alone put phase switches a tick off: 11 N m apart from run() at the default gait_T 0.10 in
+float64, and off at most switches in float32. The port is checked against run() on the same CPU MuJoCo
+physics (`JL.run_host`). In float64, head-on with steering for 4.5 s, at the default gait period, and
+with flight and strafing (gait_T 0.30, duty 0.8, vy 0.1), torques agree within 5.7e-6 N m and positions
+within 2e-8, which is float32 rounding in the swing MPC; the steering decisions are identical. In a
+float32 process the two agree within 1e-3 N m and 2e-6 in the cases tested, with one exception: a
+cylinder dead ahead may be passed on the other side, since the left and right detours tie and rounding
+picks one.
+
+MJX is a different physics engine, and two things differ from the CPU scene. MJX keeps robot-world
+contacts only (floor and obstacles, no self-collision). Without obstacles that is 96 contact slots
+instead of 1,112; each obstacle adds 56 either way (152 against 1,168 head-on, 544 against 1,560 at the
+wall). One robot's step takes 4.7 ms instead of 23.6 ms without obstacles, 4.9 ms head-on and 10.1 ms
+at the wall (MJX on the 4-core 2.1 GHz Xeon these tests ran on). Obstacle cylinders become capsules,
+because MJX's JAX implementation has no cylinder-box collision; below 0.5 m the profiles are the same.
+
+Monte Carlo on MJX (float32, on the CPU, so 4 robots per scenario; start position +-5 cm, heading
++-0.1 rad, obstacles moved by 3 cm std):
+
+| Scenario | Rows + steering: success | Smallest clearance | No keep-out: collision-free |
+|---|---|---|---|
+| head-on | 4/4 | 5.0 cm | 0/4 |
+| fast (0.4 m/s) | 3/4 | 5.2 cm | 0/4 |
+| sphere | 4/4 | 4.3 cm | 0/4 |
+| gap | 4/4 | 5.4 cm | 1/4 |
+| wall | 4/4 | 3.9 cm | 0/4 |
+| staggered | 4/4 | 4.4 cm | 0/4 |
+| diagonal | 4/4 | 5.6 cm | 0/4 |
+
+Success means upright, never touching an obstacle and ending 0.3 m past it. In the fast scenario
+(0.4 m/s) one robot fell after passing the cylinder without touching it, the gait limit at that speed
+noted under Obstacles. Without the keep-out the robots ran into the obstacles everywhere, except one gap
+run that got through untouched; that scenario's single unrandomized CPU run was clean too.
+
+**What the GPU should buy** (expected, not measured: `experiments/bench_gpu.py` measures it). The
+single-robot loop is not likely to get faster. It is latency-bound: each 5 ms tick is 8 ADMM iterations
+on 48 x 48 matrices plus four 18-variable QPs, too small to fill a GPU, and each iteration is a chain of
+tiny kernels whose launch latency a CPU does not pay. Hence `ADMM_PLATFORM=cpu` for `run()` and the
+viewer. The GPU should pay off for batches: layer-1 solves for many problems at once, and Monte Carlo,
+sweeps and safety statistics over thousands of closed-loop runs.
+
+**Measuring speed** (`experiments/bench_gpu.py`; no GPU numbers yet). It measures per-tick times on
+whatever backend it runs on. Each per-call row gives mean, median and p99 with the call count, and with
+fewer than 100 calls the maximum instead of a p99, labelled as such:
+
+- the per-tick layer-1 call (`_h_core`), the counterpart of the per-tick force solve in Results.
+  `bench_solve.py` times the whole `distributed_horizon` call instead (packing, transfer, unpacking) on
+  problems captured from a run;
+- layer 1 for a batch of problems;
+- for each closed-loop batch size, one control tick at a time from Python: the controller step on the
+  sensor readings, the physics (5 substeps) on the full MJX state, and the two fused. Each call includes
+  its Python dispatch and the wait for its result;
+- for each closed-loop batch size, the average time per control tick inside the scan, for the whole batch
+  and per robot. Nothing is dispatched per tick there, and the scan also keeps run()'s statistics.
+
+Not ported: contact gating, the `dist` body, `jumps.py` and time-varying commands (constant per robot).
+MuJoCo Warp, MJX's other implementation, is the faster physics for contact-rich scenes on NVIDIA GPUs
+and does collide cylinders with boxes: `pip install "mujoco-mjx[warp]"`, then `mjx.put_model(m,
+impl="warp")` and `mjx.make_data(m, impl="warp")` from the MjModel. `Rollout` is written for the JAX
+implementation and would need changes for it (data creation, batching, the contact fields); it was not
+tried here.
+
 ## Tests and experiments
 
 From the repository root:
 
 ```
-pytest tests                    # keep-out against an independent dense QP, steering geometry, obstacle geoms
-pytest tests --runslow          # also: no-obstacle runs bit-identical to the controller before the
-                                # keep-out (taken from git), and every obstacle scenario in MuJoCo
+pytest tests                    # keep-out against an independent dense QP, steering geometry, obstacle geoms;
+                                # GPU paths: batched layer 1, float32 against float64 (subprocesses), and
+                                # with mujoco-mjx the jax.numpy steering, gait clock, controller step, MJX scene
+pytest tests --runslow          # also: no-obstacle runs bit-identical to the controller before the keep-out
+                                # (taken from git), every obstacle scenario in MuJoCo, the ported loop against
+                                # run() in float64 and float32, and two batched MJX rollouts
 ```
+
+The tests run at the process's precision, float32 by default on a GPU: the exact float64 checks skip
+there, and the subprocess checks set their own. `ADMM_PRECISION=64 pytest tests` runs all in float64.
 
 From `experiments/` (outputs go to `results/`, which git ignores):
 
@@ -263,6 +401,8 @@ python convergence.py           # ADMM error against the dense QP versus iterati
 python bench_solve.py           # layer-1 solve time with and without obstacles, against the old code
 python plot_results.py --out ../docs/figures      # the five figures and a results table
 MUJOCO_GL=egl python record_video.py headon rows+steer    # mp4 of one run (needs ffmpeg)
+python monte_carlo.py --batch 1024     # randomized scenarios on MJX (GPU; small batches on a CPU)
+python bench_gpu.py                    # batched layer-1 and closed-loop speed on this backend, per tick
 ```
 
 ## Results

@@ -1,3 +1,9 @@
+"""Figures and the results table from ../results (scenarios.py, convergence.py, bench_solve.py outputs).
+
+    python plot_results.py                      # -> ../results/figures/
+    python plot_results.py --out ../docs/figures
+
+Needs matplotlib (requirements-dev.txt)."""
 import os, sys, json, glob, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np

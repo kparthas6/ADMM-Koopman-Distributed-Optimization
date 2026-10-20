@@ -1,3 +1,5 @@
+"""Closed loop in MuJoCo (slow: pytest --runslow): with rows + steering every scenario is passed upright without
+touching an obstacle; rows alone hold the robot at the wall; without the keep-out it hits the cylinder."""
 import pytest
 import koopman_admm as KA
 from scenarios import SCENARIOS, run_scenario

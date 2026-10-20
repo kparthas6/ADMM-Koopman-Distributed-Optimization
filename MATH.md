@@ -129,6 +129,11 @@ R_c = diag(ρ / ‖C_W,r‖²):
 warm-started and aligned by contact pattern. Every iterate's forces are inside the pyramid; the rows hold at
 convergence. Without rows the iteration is the original one.
 
+Step 1 evaluates every active set A of the pyramid G_p f ≤ h_p (unconstrained, 5 single bounds, 8 edges,
+4 cap vertices, the apex) and keeps the lowest objective among the candidates with multipliers ≥ −ε and
+G_p f ≤ h_p + ε: ε = 10⁻⁷ in float64 and 10⁻³ in float32 (the GPU default), where rounding on forces of
+about 100 N is about 10⁻⁵.
+
 ## Steering
 
 ```
@@ -164,3 +169,4 @@ swing:  q* = IK of a Raibert foothold from the measured speed with a 6 cm cleara
 | h = Σ_j ‖rowᵀ (C Φ_x + D Φ_u)[k, j]‖₂ | the same, with Φ_u = 0 and Φ_x = (∂X/∂W) E_W |
 | Φ from per-column LQR with FastSLS dual weights | open loop, since the feedback term is never applied |
 | stagewise ADMM QP, parallel-scan Riccati on the GPU | the sharing ADMM with row copies; at N = 8 a scan gives nothing |
+| batches of problems on the GPU (vmap) | `horizon_batch`, and the closed loop vmapped over robots on MJX (`jax_loop.py`) |

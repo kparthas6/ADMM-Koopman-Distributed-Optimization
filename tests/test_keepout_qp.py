@@ -1,9 +1,16 @@
+"""The keep-out ADMM in controller/dist_horizon.py against an independent reference: rows, tube and activity
+rebuilt with numpy loops, and the dense QP they define solved by qpax (experiments/keepout_reference.py)."""
 import numpy as np
 import pytest
+import backend
 import keepout_reference as KR
 import dist_horizon as DH
 
+float64_only = pytest.mark.skipif(not backend.X64, reason="exact fixed-point checks are float64; float32 is held "
+                                                          "to float64 in test_gpu_paths.py")
 
+
+@float64_only
 @pytest.mark.parametrize("name", list(KR.CASES))
 def test_fixed_point_matches_dense_qp(name):
     seed, obs, bodies = KR.CASES[name]
@@ -35,6 +42,7 @@ def test_a_binding_row_uses_the_attitude_terms():
     assert any(zi > 1.0 and np.abs(r[4][3:5]).max() > 1e-3 for zi, r in zip(z, act))
 
 
+@float64_only
 def test_warm_start_is_a_fixed_point_and_helps():
     seed, obs, bodies = KR.CASES["cylinder, 1 sphere"]
     P = KR.instance(seed, obs, bodies)
@@ -59,7 +67,7 @@ def test_inactive_rows_leave_the_solution_unchanged():
     assert st["h"]["on"].sum() == 0
     W = DH.distributed_horizon(P["x0"], P["vd"], P["wd"], P["Gs"], P["f_nom"], KR.Q, KR.M, KR.I_W, KR.DT, KR.N, KR.LAM,
                                KR.MU, KR.M*9.81, iters=8, state={})[0]
-    assert np.abs(W - W_ko).max() < 1e-9
+    assert np.abs(W - W_ko).max() < (1e-9 if backend.X64 else 1e-3)
 
 
 def test_reference_tube_closed_form():

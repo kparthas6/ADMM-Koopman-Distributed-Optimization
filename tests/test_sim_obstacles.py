@@ -1,3 +1,4 @@
+"""TorqueSim(obstacles=...): solid geoms added without touching the robot."""
 import numpy as np
 from torque_sim import TorqueSim
 

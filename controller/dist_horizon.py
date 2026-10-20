@@ -1,6 +1,6 @@
 import numpy as np
+import backend                                                  # device and precision: before any JAX use
 import jax, jax.numpy as jnp
-jax.config.update("jax_enable_x64", True)
 from functools import partial
 from dist_wrench import _sub_pre, _sub_solve, project_cone
 
@@ -20,8 +20,9 @@ KEEPOUT_DEFAULTS = dict(sigma_f=20.0, sigma_t=3.0, sigma_p0=0.0, sigma_v0=0.0, m
                         k0=False, lmax=1e5)
 
 
-@partial(jax.jit, static_argnums=(2, 3, 4, 5))
-def _h_core(packed, iters, N, L, NO=0, NB=0):
+def _h_impl(packed, iters, N, L, NO=0, NB=0):
+    """One layer-1 solve on a flat problem vector (pack_horizon's layout); returns a flat output row
+    (unpack_horizon's layout). Traceable: _h_core jits it, horizon_batch vmaps it."""
     o = [0]
     def take(n, shape=None):
         v = jax.lax.dynamic_slice(packed, (o[0],), (n,)); o[0] += n
@@ -140,6 +141,29 @@ def _h_core(packed, iters, N, L, NO=0, NB=0):
     return jnp.concatenate([W_traj.reshape(-1), f.reshape(-1), l.reshape(-1), n.astype(packed.dtype)[None]])
 
 
+_h_core = partial(jax.jit, static_argnums=(2, 3, 4, 5))(_h_impl)
+
+
+@partial(jax.jit, static_argnums=(2, 3, 4, 5))
+def horizon_batch(packed, iters, N, L, NO=0, NB=0):
+    """B layer-1 solves in one call: packed (B, P) rows from pack_horizon, all with the same N, legs,
+    obstacle and body-sphere counts (pad obstacles with far-away ones: their rows stay off). On a GPU
+    the batch is one program; with tol > 0 every problem runs until the slowest converges (each stops
+    updating at its own tolerance). Returns (B, out) rows for unpack_horizon."""
+    return jax.vmap(lambda p: _h_impl(p, iters, N, L, NO, NB))(packed)
+
+
+def unpack_horizon(out, N, L, R=0):
+    """Split a solver output row (numpy or jax): W (N, 6), f (L, N, 3), l (L, N, 6), and for R keep-out
+    rows lamc and on (N, R) and xp (N, 12); the iteration count is the last entry."""
+    nf = 6*N + 3*L*N; nl = nf + 6*L*N
+    res = dict(W=out[:6*N].reshape(N, 6), f=out[6*N:nf].reshape(L, N, 3), l=out[nf:nl].reshape(L, N, 6), iters=out[-1])
+    if R:
+        res.update(lamc=out[nl:nl + N*R].reshape(N, R), on=out[nl + N*R:nl + 2*N*R].reshape(N, R),
+                   xp=out[nl + 2*N*R:nl + 2*N*R + 12*N].reshape(N, 12))
+    return res
+
+
 def distributed_horizon(x0, v_des_seq, w_des_seq, Gs_seq, f_nom, Q, m, I_body, dt, N, lam, mu, fz_max,
                         rho=None, iters=40, state=None, relax=1.6, shift=0.0, tol=0.0, n_legs=4, keepout=None):
     """Gs_seq[k] = {i: G_{i,k}} for the contributors in stance at step k. Returns the aggregate
@@ -157,6 +181,23 @@ def distributed_horizon(x0, v_des_seq, w_des_seq, Gs_seq, f_nom, Q, m, I_body, d
     act_dist m, and the k = 0 rows unless k0, are off. Rows are soft with an exact penalty lmax, so
     they hold at ADMM convergence when feasible. state['h'] then also holds lamc (row multipliers),
     on (active rows) and xp (N, 12) predicted [p, Theta, v, w]."""
+    packed, meta = pack_horizon(x0, v_des_seq, w_des_seq, Gs_seq, f_nom, Q, m, I_body, dt, N, lam, mu, fz_max,
+                                rho, state, relax, shift, tol, n_legs, keepout)
+    L, NO, NB = n_legs, meta['NO'], meta['NB']
+    out = np.asarray(_h_core(jnp.asarray(packed, backend.DTYPE), jnp.int32(iters), N, L, NO, NB))
+    r = unpack_horizon(out, N, L, NO*NB)
+    if isinstance(state, dict):
+        state['h'] = dict(f=r['f'], l=r['l'], act=meta['act'], iters=int(r['iters']))
+        if NO*NB:
+            state['h'].update(lamc=r['lamc'], on=r['on'], xp=r['xp'])
+    return r['W'], {i: r['f'][i] for i in meta['legs']}
+
+
+def pack_horizon(x0, v_des_seq, w_des_seq, Gs_seq, f_nom, Q, m, I_body, dt, N, lam, mu, fz_max,
+                 rho=None, state=None, relax=1.6, shift=0.0, tol=0.0, n_legs=4, keepout=None):
+    """distributed_horizon's problem, warm start included, as one flat float vector for _h_core and
+    horizon_batch. Returns (packed, meta): meta holds the contact pattern act (L, N), the legs in stance
+    anywhere in the horizon, and the obstacle and body-sphere counts NO, NB."""
     L = n_legs
     legs = sorted({i for k in range(N) for i in Gs_seq[k]})
     act = np.zeros((L, N)); G = np.zeros((L, N, 6, 3)); fn = np.zeros((L, 3))
@@ -203,16 +244,7 @@ def distributed_horizon(x0, v_des_seq, w_des_seq, Gs_seq, f_nom, Q, m, I_body, d
         packed = np.concatenate([packed, pose0, xbar.ravel(), obs.ravel(), bod.ravel(),
                                  [ko['sigma_f'], ko['sigma_t'], ko['sigma_p0'], ko['sigma_v0'], ko['margin'],
                                   ko['act_dist'], float(ko['k0']), ko['lmax']], lamc0.ravel()])
-    out = np.asarray(_h_core(jnp.asarray(packed), jnp.int32(iters), N, L, NO, NB))
-    nf = 6*N + 3*L*N; nl = nf + 6*L*N
-    W = out[:6*N].reshape(N, 6); f = out[6*N:nf].reshape(L, N, 3); l = out[nf:nl].reshape(L, N, 6)
-    if isinstance(state, dict):
-        state['h'] = dict(f=f, l=l, act=act, iters=int(out[-1]))
-        if NO*NB:
-            R = NO*NB
-            state['h'].update(lamc=out[nl:nl + N*R].reshape(N, R), on=out[nl + N*R:nl + 2*N*R].reshape(N, R),
-                              xp=out[nl + 2*N*R:nl + 2*N*R + 12*N].reshape(N, 12))
-    return W, {i: f[i] for i in legs}
+    return packed, dict(act=act, legs=legs, NO=NO, NB=NB)
 
 
 def centralized_horizon(x0, v_des_seq, w_des_seq, Gs_seq, f_nom, Q, m, I_body, dt, N, lam, mu, fz_max, iters=6000):

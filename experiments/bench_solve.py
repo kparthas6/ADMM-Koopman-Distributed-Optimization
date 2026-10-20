@@ -1,7 +1,12 @@
+"""Cost of the keep-out rows in the layer-1 solve. Captures the solver inputs of a trot held at the 8-cylinder
+wall (rows active), then replays 60 of them, interleaved, against: the controller before the keep-out (from
+git), the current one without obstacles, with one cylinder, and with the whole wall. Median per call.
+Writes ../results/bench.json."""
 import os, sys, copy, json, time, tempfile, importlib.util
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import keepout_reference as KR
+import backend, jax
 import koopman_admm as KA, dist_horizon as DH
 from torque_sim import TorqueSim
 from scenarios import WALL
@@ -26,6 +31,7 @@ if __name__ == "__main__":
     if KR.extract_reference(tmp):
         spec = importlib.util.spec_from_file_location("dist_horizon_ref", os.path.join(tmp, "controller", "dist_horizon.py"))
         ref = importlib.util.module_from_spec(spec); spec.loader.exec_module(ref)
+        jax.config.update("jax_enable_x64", backend.X64)          # the old module forces float64 process-wide
         conf.insert(0, ("before the keep-out, no obstacles", ref.distributed_horizon, 0))
 
     def kwargs(k, n_obs):

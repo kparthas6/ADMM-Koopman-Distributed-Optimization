@@ -1,3 +1,9 @@
+"""Render a scenario run to mp4 (real time, 40 fps), with the body spheres and the planned trunk path drawn in.
+
+    MUJOCO_GL=egl python record_video.py headon rows+steer          # -> ../results/videos/headon_rows_steer.mp4
+    xvfb-run -a env MUJOCO_GL=glfw python record_video.py wall rows   # headless without EGL
+
+Needs ffmpeg on the PATH, an offscreen OpenGL context (MUJOCO_GL=egl or glfw under xvfb) and Pillow."""
 import os, sys, subprocess, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np

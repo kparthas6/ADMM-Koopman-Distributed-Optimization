@@ -1,8 +1,8 @@
 import os, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
 import numpy as np
+import backend                                                  # device and precision: before any JAX use
 import jax, jax.numpy as jnp, qpax
-jax.config.update("jax_enable_x64", True)
 import mujoco
 from torque_sim import TorqueSim
 import leg_kinematics as kin

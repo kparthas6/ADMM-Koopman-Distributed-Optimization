@@ -1,3 +1,5 @@
+"""ADMM error against the exact QP versus iteration count, cold and warm started, on the keep-out instances of
+keepout_reference.py; and the position-row tightening per horizon step. Writes ../results/convergence.json."""
 import os, sys, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np

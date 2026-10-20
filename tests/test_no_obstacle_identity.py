@@ -1,3 +1,6 @@
+"""Without obstacles the controller must be bit-for-bit the one before the keep-out (slow: pytest --runslow).
+Both versions run on this machine, in separate processes, from the same cached leg operators; the old one
+is taken from git (the parent of the commit that introduced the keep-out, or $KEEPOUT_REF)."""
 import os, sys, subprocess
 import numpy as np
 import pytest
@@ -8,7 +11,8 @@ HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_trajectories
 
 
 def trajectories(root, out):
-    subprocess.run([sys.executable, "-B", HELPER, root, out], check=True, capture_output=True)
+    env = dict(os.environ, ADMM_PRECISION="64", ADMM_PLATFORM="cpu")    # the old code is float64 on the CPU
+    subprocess.run([sys.executable, "-B", HELPER, root, out], check=True, capture_output=True, env=env)
     return np.load(out)
 
 

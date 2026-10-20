@@ -1,3 +1,5 @@
+"""Helper for test_no_obstacle_identity.py: run five obstacle-free closed loops with the controller in
+<root> and save their qpos trajectories to <out.npz>.   python _trajectories.py <root> <out.npz>"""
 import os, sys
 root, out = sys.argv[1], sys.argv[2]
 sys.path.insert(0, os.path.join(root, "common")); sys.path.insert(0, os.path.join(root, "controller"))

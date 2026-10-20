@@ -1,3 +1,6 @@
+"""Independent reference for the keep-out rows of controller/dist_horizon.py: horizon instances, the rows
+and tube rebuilt with plain numpy loops, and the dense QP they define, solved by qpax. Used by
+tests/test_keepout_qp.py and experiments/convergence.py."""
 import os, sys, subprocess, tarfile, io
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "common")); sys.path.insert(0, os.path.join(ROOT, "controller"))

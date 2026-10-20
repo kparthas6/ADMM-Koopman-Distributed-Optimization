@@ -1,3 +1,4 @@
+"""steer_offset: the heading it picks must let the actual body spheres, swept along the walk, clear the obstacles."""
 import numpy as np
 import pytest
 import koopman_admm as KA

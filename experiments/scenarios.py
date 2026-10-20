@@ -1,3 +1,11 @@
+"""Obstacle scenarios for the keep-out, run in MuJoCo without rendering.
+
+    python scenarios.py                       # every scenario x variant -> ../results/scenarios/
+    python scenarios.py headon wall           # selected scenarios
+    python scenarios.py --variants rows+steer
+
+Variants: none (obstacles only in the scene), rows (keep-out rows, no steering), rows+steer.
+Each run saves its log, with a summary, as <scenario>_<variant>.npz; plot_results.py tabulates them."""
 import os, sys, json, time, argparse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "common")); sys.path.insert(0, os.path.join(ROOT, "controller"))

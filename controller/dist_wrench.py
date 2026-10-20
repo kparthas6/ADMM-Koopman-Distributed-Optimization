@@ -1,6 +1,6 @@
 import numpy as np
+import backend                                                  # device and precision: before any JAX use
 import jax, jax.numpy as jnp
-jax.config.update("jax_enable_x64", True)
 
 _SETS1 = [[0], [1], [2], [3], [4]]                     # one active bound
 _SETS2 = [[0, 2], [0, 3], [1, 2], [1, 3],              # two facets, or facet + cap
@@ -71,17 +71,18 @@ def _sub_solve(pre, g):
     take the lowest objective."""
     A, hS = pre['A'], pre['h']
     S = g.shape[0]
+    tol = 1e-7 if g.dtype == jnp.float64 else 1e-3                  # float32: rounding on ~100 N forces
     fs = [jnp.einsum('sab,sb->sa', pre['Pinv'], g)[:, None]]         # unconstrained
     ok = [jnp.ones((S, 1), bool)]
     for Kinv, (Ag, hg) in zip(pre['K'], pre['Ah']):
         C, r = Ag.shape[0], Ag.shape[1]
         rhs = jnp.concatenate([jnp.broadcast_to(g[:, None], (S, C, 3)), hg], axis=2)
         x = jnp.einsum('scab,scb->sca', Kinv, rhs)
-        fs.append(x[..., :3]); ok.append((x[..., 3:] >= -1e-7).all(-1))
+        fs.append(x[..., :3]); ok.append((x[..., 3:] >= -tol).all(-1))
     fs.append(jnp.zeros((S, 1, 3))); ok.append(jnp.ones((S, 1), bool))   # pyramid apex
     F = jnp.concatenate(fs, axis=1)                                   # (S, 19, 3)
     OK = jnp.concatenate(ok, axis=1)
-    feas = (jnp.einsum('ab,scb->sca', A, F) <= hS[:, None] + 1e-7).all(-1)
+    feas = (jnp.einsum('ab,scb->sca', A, F) <= hS[:, None] + tol).all(-1)
     J = 0.5*jnp.einsum('sca,sab,scb->sc', F, pre['P'], F) - jnp.einsum('sca,sa->sc', F, g)
     J = jnp.where(OK & feas, J, jnp.inf)
     best = jnp.argmin(J, axis=1)

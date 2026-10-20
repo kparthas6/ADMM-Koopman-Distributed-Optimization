@@ -1,0 +1,5 @@
+-r requirements-dev.txt
+# NVIDIA GPU (Linux or WSL2): JAX with its CUDA 12 wheels; mujoco-mjx (for the batched closed loop) comes from
+# requirements-dev.txt and must match mujoco's version. jax[cuda13] also works with a CUDA 13 driver.
+# Tested on the CPU backend with jax 0.11.2 and mujoco-mjx 3.15.0; no GPU was available.
+jax[cuda12]==0.11.2
