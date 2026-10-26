@@ -126,8 +126,8 @@ R_c = diag(ρ / ‖C_W,r‖²):
 ```
 
 (f, y) and s are the two ADMM blocks, so the fixed point is the constrained QP. 8 iterations per tick,
-warm-started and aligned by contact pattern. Every iterate's forces are inside the pyramid; the rows hold at
-convergence. Without rows the iteration is the original one.
+warm-started and aligned by contact pattern. Every iterate's forces are inside the pyramid, to within the ε
+of step 1 below; the rows hold at convergence. Without rows the iteration is the original one.
 
 Step 1 evaluates every active set A of the pyramid G_p f ≤ h_p (unconstrained, 5 single bounds, 8 edges,
 4 cap vertices, the apex) and keeps the lowest objective among the candidates with multipliers ≥ −ε and
@@ -168,5 +168,26 @@ swing:  q* = IK of a Raibert foothold from the measured speed with a 6 cm cleara
 | g(x, u) ≤ 0 linearized every SQP iteration | the keep-out, linearized every 5 ms tick |
 | h = Σ_j ‖rowᵀ (C Φ_x + D Φ_u)[k, j]‖₂ | the same, with Φ_u = 0 and Φ_x = (∂X/∂W) E_W |
 | Φ from per-column LQR with FastSLS dual weights | open loop, since the feedback term is never applied |
-| stagewise ADMM QP, parallel-scan Riccati on the GPU | the sharing ADMM with row copies; at N = 8 a scan gives nothing |
+| stagewise ADMM QP, parallel-scan Riccati on the GPU | the sharing ADMM with row copies, factored once per tick (see below) |
 | batches of problems on the GPU (vmap) | `horizon_batch`, and the closed loop vmapped over robots on MJX (`jax_loop.py`) |
+
+## Relation to Primal-Dual iLQR
+
+Amatucci, Sousa-Pinto, Turrisi, Orban, Barasuol and Semini, "Primal-Dual iLQR for GPU-Accelerated Learning and
+Control in Legged Robots", IEEE RA-L 11(1), 2026 (arXiv 2506.07823), code in `iit-DLSLab/mpx` and
+`iit-DLSLab/jax_ocp_solvers`; compared here from the code:
+
+| Primal-dual iLQR (mpx) | Here |
+|---|---|
+| one Gauss-Newton SQP iteration per MPC call on the nonlinear model, multiple shooting, duals carried | the force QP is linear in the wrench; 8 warm-started ADMM iterations per tick |
+| LQR step by associative scans over the horizon (Särkkä and García-Fernández), dense batched algebra per stage | shared step factored once per tick (the 6N x 6N inverse), one matvec per iteration |
+| friction cone as a soft log barrier (circular, μ 0.7); an interior-point variant | exact per-foot pyramid, inside it at every iterate (to ε) |
+| batches by vmap over environments; its batched examples use the sequential Riccati | vmap over robots (`horizon_batch`, `jax_loop.Rollout`) |
+| float32 for online MPC (its offline trajectory-optimization examples enable float64) | float32 on a GPU, float64 on the CPU |
+
+The shared step solved instead by a Riccati factor or by an associative scan gives the same iterates (to
+10⁻¹⁰ N in float64). On the CPU, in µs per problem for 8 iterations (median, batch 256): with keep-out rows,
+911 dense, 935 Riccati, 944 scan; without rows 895, 751, 682; in float32 with rows 759, 763, 763; one
+problem with rows 2,141, 1,999, 3,050. At N = 32 (rows, batch 256) the Riccati factor is about 2x faster
+(7,246 dense, 3,742 Riccati, 4,271 scan), so a longer horizon would call for it. Not measured on a GPU.
+

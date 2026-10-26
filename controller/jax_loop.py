@@ -287,7 +287,7 @@ class Controller:
             lamc0 = jnp.where(hp, s["hlamc"][src], 0.0)
             parts += [pose0, xbar.ravel(), obs.ravel(), jnp.asarray(self.bod, FT).ravel(),
                       jnp.asarray(self.ko_scal, FT), lamc0.ravel()]
-        out = DH._h_impl(jnp.concatenate(parts), jnp.int32(self.NIT), N, L, NO, NB)
+        out = DH._h_impl(jnp.concatenate(parts), int(self.NIT), N, L, NO, NB)     # static: fixed-trip loop
         r = DH.unpack_horizon(out, N, L, R)
         F = r["f"][:, 0]
         # layer 2: stance J^T, swing IK + Koopman MPC
@@ -317,11 +317,13 @@ class Controller:
         return s2, tau, info
 
 
-def mjx_model(obstacles=(), contacts="world", sim_dt=0.001):
+def mjx_model(obstacles=(), contacts="world", sim_dt=0.001, ls_iterations=None):
     """The TorqueSim scene for MJX: obstacles as world geoms (x, y, r) capsules 0.5 m long (MJX's JAX
     implementation has no cylinder-box collision) and (x, y, z, r) spheres; contacts 'world' keeps
     robot-world pairs only, 'all' every pair the CPU scene has (with self-collision; about 5x slower in MJX
-    without obstacles)."""
+    without obstacles). ls_iterations caps the Newton solver's line search (None: the model's 50). MJX runs
+    the line search as a fixed-length scan, so under vmap every robot pays all of it; 8 made a 16-robot
+    tick 2.4x faster on the CPU, with states 2.5e-5 apart after 20 ticks."""
     spec = mujoco.MjSpec.from_file(os.path.abspath(torque_sim._SCENE))
     for j, o in enumerate(obstacles):
         g = spec.worldbody.add_geom(); g.name = f"obstacle{j}"; g.rgba = [0.85, 0.35, 0.2, 1.0]
@@ -330,6 +332,8 @@ def mjx_model(obstacles=(), contacts="world", sim_dt=0.001):
         else:
             g.type = mujoco.mjtGeom.mjGEOM_SPHERE; g.size = [o[3], 0.0, 0.0]; g.pos = [o[0], o[1], o[2]]
     m = spec.compile(); m.opt.timestep = sim_dt
+    if ls_iterations is not None:
+        m.opt.ls_iterations = int(ls_iterations)
     if contacts == "world":
         world = m.geom_bodyid == 0; coll = (m.geom_contype | m.geom_conaffinity) > 0
         m.geom_contype[coll & ~world], m.geom_conaffinity[coll & ~world] = 2, 0
@@ -351,10 +355,10 @@ class Rollout:
     obstacle template (count and types); each run() compiles once per (batch, ticks, log) and then reuses
     the program."""
     def __init__(self, legs=None, obstacles=None, mode="trot", gait_T=0.10, duty=1.0, k_cap=0.10, steer=True,
-                 keepout=True, control_dt=0.005, sim_dt=0.001, contacts="world"):
+                 keepout=True, control_dt=0.005, sim_dt=0.001, contacts="world", ls_iterations=None):
         self.template = [tuple(float(v) for v in o) for o in obstacles] if obstacles is not None else []
         self.kinds = [len(o) for o in self.template]
-        self.m = mjx_model(self.template, contacts, sim_dt)
+        self.m = mjx_model(self.template, contacts, sim_dt, ls_iterations)
         self.mx = mjx.put_model(self.m)
         oid = lambda kind, n: mujoco.mj_name2id(self.m, kind, n)
         jn = [oid(mujoco.mjtObj.mjOBJ_JOINT, f"{l}_{j}_joint") for l in torque_sim.LEGS for j in ("hip", "thigh", "calf")]

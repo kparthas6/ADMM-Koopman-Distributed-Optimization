@@ -22,7 +22,10 @@ KEEPOUT_DEFAULTS = dict(sigma_f=20.0, sigma_t=3.0, sigma_p0=0.0, sigma_v0=0.0, m
 
 def _h_impl(packed, iters, N, L, NO=0, NB=0):
     """One layer-1 solve on a flat problem vector (pack_horizon's layout); returns a flat output row
-    (unpack_horizon's layout). Traceable: _h_core jits it, horizon_batch vmaps it."""
+    (unpack_horizon's layout). Traceable: _h_core jits it, horizon_batch vmaps it. iters traced (a jax
+    integer): a while_loop that stops at tol. iters a Python int: a loop of exactly iters steps that stops
+    updating at tol, with the same result; its trip count is known to XLA (on a GPU, no host round trip
+    per iteration) and it is reverse-differentiable."""
     o = [0]
     def take(n, shape=None):
         v = jax.lax.dynamic_slice(packed, (o[0],), (n,)); o[0] += n
@@ -131,8 +134,12 @@ def _h_impl(packed, iters, N, L, NO=0, NB=0):
 
     s0 = jnp.einsum('lkab,lkb->lka', G, f0) * m_
     extra = (jnp.where(rc > 0, lamc0.reshape(-1)/rcs, 0.0), C_W @ s0.sum(0).reshape(-1)) if R else ()
-    n, f, l, s, *rest = jax.lax.while_loop(moving, step, (jnp.int32(0), f0, l0, s0, *extra,
-                                                          jnp.asarray(jnp.inf, packed.dtype)))
+    init = (jnp.int32(0), f0, l0, s0, *extra, jnp.asarray(jnp.inf, packed.dtype))
+    if isinstance(iters, int):
+        frozen = lambda _, c: jax.tree.map(lambda a, b: jnp.where(moving(c), a, b), step(c), c)
+        n, f, l, s, *rest = jax.lax.fori_loop(0, iters, frozen, init)
+    else:
+        n, f, l, s, *rest = jax.lax.while_loop(moving, step, init)
     W_traj = (jnp.einsum('lkab,lkb->lka', G, f) * m_).sum(0)
     if R:
         xp = jnp.einsum('kxw,w->kx', S_x, W_traj.reshape(-1)) + xb
@@ -144,12 +151,12 @@ def _h_impl(packed, iters, N, L, NO=0, NB=0):
 _h_core = partial(jax.jit, static_argnums=(2, 3, 4, 5))(_h_impl)
 
 
-@partial(jax.jit, static_argnums=(2, 3, 4, 5))
+@partial(jax.jit, static_argnums=(1, 2, 3, 4, 5))
 def horizon_batch(packed, iters, N, L, NO=0, NB=0):
     """B layer-1 solves in one call: packed (B, P) rows from pack_horizon, all with the same N, legs,
-    obstacle and body-sphere counts (pad obstacles with far-away ones: their rows stay off). On a GPU
-    the batch is one program; with tol > 0 every problem runs until the slowest converges (each stops
-    updating at its own tolerance). Returns (B, out) rows for unpack_horizon."""
+    obstacle and body-sphere counts (pad obstacles with far-away ones: their rows stay off). iters is a
+    Python int (static): every problem runs iters steps and stops updating at its own tolerance. On a GPU
+    the batch is one program. Returns (B, out) rows for unpack_horizon."""
     return jax.vmap(lambda p: _h_impl(p, iters, N, L, NO, NB))(packed)
 
 

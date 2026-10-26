@@ -16,6 +16,7 @@
 
     python bench_gpu.py                                    # default sizes
     python bench_gpu.py --solve 1 64 1024 8192 --rollout 1 64 1024 --seconds 2 --ticks 200 --reps 20
+    python bench_gpu.py --rollout 64 1024 --ls-iterations 8     # MJX line search capped (see jax_loop.mjx_model)
 
 Writes ../results/bench_gpu.json. Numbers are for the backend it runs on: a CPU run is a baseline, not a
 GPU estimate."""
@@ -90,6 +91,7 @@ if __name__ == "__main__":
     ap.add_argument("--seconds", type=float, default=1.0)
     ap.add_argument("--ticks", type=int, default=100, help="ticks timed one call at a time")
     ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--ls-iterations", type=int, default=None, help="cap MJX's line search (default: the model's 50)")
     a = ap.parse_args()
     if a.ticks < 1 or a.reps < 1 or int(a.seconds/0.005) < 1:
         ap.error("--ticks and --reps must be >= 1 and --seconds at least one 5 ms control tick")
@@ -102,12 +104,14 @@ if __name__ == "__main__":
     print(f"layer 1, one _h_core call: {fmt(single)}")
     for B in a.solve:
         pk = jnp.tile(base, (B // len(base) + 1, 1))[:B]
-        s = stats(times(lambda: DH.horizon_batch(pk, it, KR.N, 4, 1, 3), a.reps))
+        s = stats(times(lambda: DH.horizon_batch(pk, 8, KR.N, 4, 1, 3), a.reps))
         t = s["p50_ms"]/1e3
         res["solve"][str(B)] = dict(s, us_per_problem=1e6*t/B, problems_per_s=B/t)
         print(f"layer 1, batch {B:6d}: {fmt(s)} | {1e6*t/B:8.2f} us per problem | {B/t:10.0f} solves/s "
               f"({single['p50_ms']/1e3*B/t:.1f}x one-at-a-time)")
-    roll = JL.Rollout(obstacles=[(1.2, 0.0, 0.15)], gait_T=0.25)
+    roll = JL.Rollout(obstacles=[(1.2, 0.0, 0.15)], gait_T=0.25, ls_iterations=a.ls_iterations)
+    res["mjx_opt"] = dict(iterations=int(roll.m.opt.iterations), ls_iterations=int(roll.m.opt.ls_iterations))
+    print(f"MJX solver: {res['mjx_opt']['iterations']} iterations, line search {res['mjx_opt']['ls_iterations']}")
     nst = int(a.seconds/roll.dt)
     for B in a.rollout:
         kw = dict(vx=np.full(B, 0.3), y0=np.linspace(-0.05, 0.05, B))

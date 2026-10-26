@@ -271,6 +271,8 @@ cd controller && python -c "import backend; print(backend.info())"    # should s
 - Memory grows with the batch: the MJX state of every robot, and with `log=True` per-tick traces of
   B x ticks x about 12 values.
 - MJX prints "Failed to import warp" and "Failed to import mujoco_warp" when imported; that is harmless.
+- `ADMM_JAX_CACHE=<directory>` turns on JAX's persistent compilation cache, so later processes reuse
+  compiled programs instead of compiling again.
 
 **Backend and precision** (`controller/backend.py`, read at the first import):
 
@@ -331,6 +333,14 @@ wall). One robot's step takes 4.7 ms instead of 23.6 ms without obstacles, 4.9 m
 at the wall (MJX on the 4-core 2.1 GHz Xeon these tests ran on). Obstacle cylinders become capsules,
 because MJX's JAX implementation has no cylinder-box collision; below 0.5 m the profiles are the same.
 
+For large batches, cap MJX's line search: `Rollout(..., ls_iterations=8)`, or `--ls-iterations 8` in
+`monte_carlo.py` and `bench_gpu.py`. MJX runs the line search as a fixed-length scan of `ls_iterations`
+steps (50 by default), so under vmap every robot pays all of them on every Newton iteration. With 8, a
+16-robot tick took 2.4x less time on this CPU, and the states were 2.5e-5 apart after 20 ticks. The
+results in this section use the default. On the controller side, the batched path runs the 8 ADMM
+iterations as a loop of known length (a static iteration count; same result as the stopping loop), so
+XLA need not test a condition after each iteration.
+
 Monte Carlo on MJX (float32, on the CPU, so 4 robots per scenario; start position +-5 cm, heading
 +-0.1 rad, obstacles moved by 3 cm std):
 
@@ -354,7 +364,10 @@ single-robot loop is not likely to get faster. It is latency-bound: each 5 ms ti
 on 48 x 48 matrices plus four 18-variable QPs, too small to fill a GPU, and each iteration is a chain of
 tiny kernels whose launch latency a CPU does not pay. Hence `ADMM_PLATFORM=cpu` for `run()` and the
 viewer. The GPU should pay off for batches: layer-1 solves for many problems at once, and Monte Carlo,
-sweeps and safety statistics over thousands of closed-loop runs.
+sweeps and safety statistics over thousands of closed-loop runs. GPU solvers built for one robot, such as
+the primal-dual iLQR of Amatucci et al. (RA-L 2026, arXiv 2506.07823), win on long horizons and large
+states (whole-body models), where a parallel scan over the horizon pays off; layer 1 here is an 8-step
+force QP (MATH.md, Relation to Primal-Dual iLQR).
 
 **Measuring speed** (`experiments/bench_gpu.py`; no GPU numbers yet). It measures per-tick times on
 whatever backend it runs on. Each per-call row gives mean, median and p99 with the call count, and with
@@ -368,7 +381,10 @@ fewer than 100 calls the maximum instead of a p99, labelled as such:
   sensor readings, the physics (5 substeps) on the full MJX state, and the two fused. Each call includes
   its Python dispatch and the wait for its result;
 - for each closed-loop batch size, the average time per control tick inside the scan, for the whole batch
-  and per robot. Nothing is dispatched per tick there, and the scan also keeps run()'s statistics.
+  and per robot. There is no Python call per tick there, and the scan also keeps run()'s statistics.
+  XLA still launches every tick's kernels, and the loops whose length depends on the data (MJX's Newton
+  solver, the qpax swing MPCs) run to the slowest robot; on a GPU such loops may return to the host on
+  every iteration.
 
 Not ported: contact gating, the `dist` body, `jumps.py` and time-varying commands (constant per robot).
 MuJoCo Warp, MJX's other implementation, is the faster physics for contact-rich scenes on NVIDIA GPUs

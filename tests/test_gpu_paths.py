@@ -48,11 +48,29 @@ def test_horizon_batch_matches_single_solves():
     obs, bod = [[0.6, 0.1, 0.0, 0.2, 1.0]], KA.KEEPOUT_CFG["bodies"]
     pk = np.stack([_pack(KR.instance(s, obs, bod, sched=TROT if s % 2 else None)) for s in range(5)])
     one = np.stack([np.asarray(DH._h_core(jnp.asarray(p, backend.DTYPE), jnp.int32(8), KR.N, 4, 1, 3)) for p in pk])
-    many = np.asarray(DH.horizon_batch(jnp.asarray(pk, backend.DTYPE), jnp.int32(8), KR.N, 4, 1, 3))
+    many = np.asarray(DH.horizon_batch(jnp.asarray(pk, backend.DTYPE), 8, KR.N, 4, 1, 3))
     for b in range(len(pk)):
         r1, r2 = DH.unpack_horizon(one[b], KR.N, 4, 3), DH.unpack_horizon(many[b], KR.N, 4, 3)
         assert np.abs(r1["W"] - r2["W"]).max() < (1e-8 if backend.X64 else 1e-2)
         assert np.array_equal(r1["on"], r2["on"])
+
+
+def test_fixed_trip_loop_matches_while_loop():
+    """A static iteration count (fixed-trip loop, as jax_loop uses) gives the while_loop's result and iteration
+    count, with tol 0 and with an early stop."""
+    import jax
+    fixed = jax.jit(DH._h_impl, static_argnums=(1, 2, 3, 4, 5))
+    for tol in (0.0, 0.5):                                         # N per iteration; 0.5 stops some problems early
+        early = 0
+        for s in range(3):
+            P = KR.instance(s, [[0.6, 0.1, 0.0, 0.2, 1.0]], KA.KEEPOUT_CFG["bodies"], sched=TROT if s % 2 else None)
+            p = jnp.asarray(DH.pack_horizon(P["x0"], P["vd"], P["wd"], P["Gs"], P["f_nom"], KR.Q, KR.M, KR.I_W, KR.DT, KR.N,
+                                            KR.LAM, KR.MU, KR.M*9.81, state={}, tol=tol, keepout=P["ko"])[0], backend.DTYPE)
+            a = np.asarray(DH._h_core(p, jnp.int32(40), KR.N, 4, 1, 3)); b = np.asarray(fixed(p, 40, KR.N, 4, 1, 3))
+            assert a[-1] == b[-1]                                          # same iteration count
+            assert np.abs(a - b).max() <= (0.0 if backend.X64 else 1e-3*np.abs(a).max())
+            early += a[-1] < 40
+        assert (early > 0) == (tol > 0)
 
 
 def test_float32_layer1_matches_float64():

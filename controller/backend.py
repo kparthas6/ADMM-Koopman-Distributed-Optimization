@@ -4,6 +4,9 @@
                                            is installed and sees one)
     ADMM_PRECISION   auto | 64 | 32        layer-1 (and batched-loop) floats; auto: float64 on the CPU,
                                            float32 on a GPU
+    ADMM_JAX_CACHE   <directory>           optional: JAX's persistent compilation cache there, so a new
+                                           process reuses compiled programs (a Rollout takes about a
+                                           minute to compile)
 
 Consumer GPUs (GeForce/RTX) run float64 at 1/32 to 1/64 of their float32 rate, hence the float32
 default there. float32 matmuls are pinned to full precision: on Ampere and later GPUs XLA's default
@@ -35,6 +38,8 @@ if _prec not in ("auto", "64", "32"):
 X64 = PLATFORM == "cpu" if _prec == "auto" else _prec == "64"
 jax.config.update("jax_enable_x64", X64)
 jax.config.update("jax_default_matmul_precision", "highest")
+if os.environ.get("ADMM_JAX_CACHE"):
+    jax.config.update("jax_compilation_cache_dir", os.path.abspath(os.environ["ADMM_JAX_CACHE"]))
 DTYPE = jnp.float64 if X64 else jnp.float32
 
 
